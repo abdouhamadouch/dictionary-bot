@@ -2,7 +2,6 @@ import os
 import re
 import logging
 import requests
-from bs4 import BeautifulSoup
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -13,10 +12,6 @@ from telegram.ext import (
     filters,
 )
 
-# =========================================================
-# CONFIG
-# =========================================================
-
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -24,12 +19,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
 
+
 WIKTIONARY_API = "https://en.wiktionary.org/w/api.php"
 ONELOOK_URL = "https://www.onelook.com/"
 
 HEADERS = {
     "User-Agent": "DictionaryBot/1.0"
 }
+
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -43,19 +40,17 @@ logging.basicConfig(
 
 def get_wiktionary_data(word):
 
-    params = {
-        "action": "parse",
-        "page": word,
-        "prop": "wikitext",
-        "redirects": 1,
-        "format": "json",
-        "formatversion": "2",
-    }
-
     try:
         response = requests.get(
             WIKTIONARY_API,
-            params=params,
+            params={
+                "action": "parse",
+                "page": word,
+                "prop": "wikitext",
+                "redirects": 1,
+                "format": "json",
+                "formatversion": "2",
+            },
             headers=HEADERS,
             timeout=15,
         )
@@ -87,15 +82,13 @@ def get_wiktionary_data(word):
 
 def get_onelook_data(word):
 
-    params = {
-        "w": word,
-    }
-
     try:
 
         response = requests.get(
             ONELOOK_URL,
-            params=params,
+            params={
+                "w": word,
+            },
             headers=HEADERS,
             timeout=15,
         )
@@ -107,67 +100,7 @@ def get_onelook_data(word):
         if not html:
             return None
 
-        soup = BeautifulSoup(
-            html,
-            "html.parser",
-        )
-
-        text = soup.get_text(
-            "\n",
-            strip=True,
-        )
-
-        if not text:
-            return None
-
-        # Check whether OneLook actually
-        # found dictionary information.
-        found = re.search(
-            r"We found\s+(\d+)\s+dict",
-            text,
-            re.IGNORECASE,
-        )
-
-        dictionary_count = 0
-
-        if found:
-            dictionary_count = int(
-                found.group(1)
-            )
-
-        definitions = []
-
-        # OneLook page contains sections such as
-        # "Definitions from Wiktionary".
-        lines = [
-            line.strip()
-            for line in text.splitlines()
-            if line.strip()
-        ]
-
-        for i, line in enumerate(lines):
-
-            if (
-                "Definitions from" in line
-                or "definition" in line.lower()
-            ):
-                continue
-
-            # Capture useful short definition-like
-            # lines without trying to fully parse
-            # OneLook's entire page.
-            if 10 <= len(line) <= 500:
-
-                if line not in definitions:
-
-                    definitions.append(line)
-
-        return {
-            "word": word,
-            "dictionary_count": dictionary_count,
-            "text": text,
-            "definitions": definitions[:30],
-        }
+        return html
 
     except Exception as e:
 
@@ -186,7 +119,7 @@ def get_onelook_data(word):
 def collect_sources(word):
 
     logging.info(
-        "Searching: %s",
+        "Searching sources for: %s",
         word,
     )
 
@@ -212,7 +145,7 @@ def collect_sources(word):
 
 
 # =========================================================
-# TEMPORARY DISPLAY
+# TEMPORARY RESULT
 # =========================================================
 
 def format_result(data):
@@ -222,45 +155,16 @@ def format_result(data):
     wiktionary = data["wiktionary"]
     onelook = data["onelook"]
 
-    lines = [
-        f"📖 <b>{word.upper()}</b>",
-        "",
-        "━━━━━━━━━━━━━━━━━━",
-        "",
-        "📚 <b>Dictionary Sources</b>",
-        "",
-    ]
-
-    if wiktionary:
-        lines.append("• Wiktionary: ✅ Found")
-    else:
-        lines.append("• Wiktionary: ❌ Not found")
-
-    if onelook:
-        count = onelook["dictionary_count"]
-
-        if count:
-            lines.append(
-                f"• OneLook: ✅ Found "
-                f"({count} dictionaries)"
-            )
-        else:
-            lines.append(
-                "• OneLook: ✅ Page found"
-            )
-    else:
-        lines.append(
-            "• OneLook: ❌ Not found"
-        )
-
-    lines.extend([
-        "",
-        "━━━━━━━━━━━━━━━━━━",
-        "",
-        "🧪 Source collection is working.",
-    ])
-
-    return "\n".join(lines)
+    return (
+        f"📖 <b>{word.upper()}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"📚 <b>Sources</b>\n\n"
+        f"• Wiktionary: "
+        f"{'✅ Found' if wiktionary else '❌ Not found'}\n"
+        f"• OneLook: "
+        f"{'✅ Page found' if onelook else '❌ Not found'}\n\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
 
 
 # =========================================================
@@ -280,13 +184,13 @@ async def analyze_word(
     if " " in word:
 
         await update.message.reply_text(
-            "📚 For now, please send one English word."
+            "📚 For now, send one English word."
         )
 
         return
 
     await update.message.reply_text(
-        "🔎 Searching dictionary sources..."
+        "🔎 Searching..."
     )
 
     data = collect_sources(word)
@@ -294,8 +198,7 @@ async def analyze_word(
     if not data["wiktionary"] and not data["onelook"]:
 
         await update.message.reply_text(
-            f"❌ No dictionary data found for "
-            f"<b>{word}</b>.",
+            f"❌ No data found for <b>{word}</b>.",
             parse_mode="HTML",
         )
 
@@ -369,7 +272,6 @@ async def handle_group(
         flags=re.IGNORECASE,
     ).strip()
 
-    # Reply mode
     if not clean_text:
 
         replied = message.reply_to_message
