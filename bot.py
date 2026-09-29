@@ -1,7 +1,8 @@
 import os
+import re
 import logging
 import requests
-import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -41,69 +42,43 @@ logging.basicConfig(
 # =========================================================
 
 def get_wiktionary_data(word):
-    word = word.strip()
 
-    if not word:
-        return None
+    params = {
+        "action": "parse",
+        "page": word,
+        "prop": "wikitext",
+        "redirects": 1,
+        "format": "json",
+        "formatversion": "2",
+    }
 
-    titles = [
-        word,
-        word.lower(),
-    ]
+    try:
+        response = requests.get(
+            WIKTIONARY_API,
+            params=params,
+            headers=HEADERS,
+            timeout=15,
+        )
 
-    tried = set()
+        response.raise_for_status()
 
-    for title in titles:
-
-        if title in tried:
-            continue
-
-        tried.add(title)
-
-        params = {
-            "action": "parse",
-            "page": title,
-            "prop": "wikitext",
-            "redirects": 1,
-            "format": "json",
-            "formatversion": "2",
-        }
-
-        try:
-            response = requests.get(
-                WIKTIONARY_API,
-                params=params,
-                headers=HEADERS,
-                timeout=15,
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-        except requests.RequestException as e:
-            logging.error(
-                "Wiktionary request error: %s",
-                e,
-            )
-            return None
-
-        except ValueError:
-            logging.error(
-                "Wiktionary returned invalid JSON."
-            )
-            return None
+        data = response.json()
 
         parsed = data.get("parse")
 
-        if parsed:
+        if not parsed:
+            return None
 
-            wikitext = parsed.get("wikitext")
+        return parsed.get("wikitext")
 
-            if wikitext:
-                return wikitext
+    except Exception as e:
 
-    return None
+        logging.error(
+            "Wiktionary error: %s",
+            e,
+        )
+
+        return None
 
 
 # =========================================================
@@ -111,24 +86,13 @@ def get_wiktionary_data(word):
 # =========================================================
 
 def get_onelook_data(word):
-    """
-    Get basic OneLook XML results.
-
-    OneLook's XML interface supports basic
-    word lookups.
-    """
-
-    word = word.strip()
-
-    if not word:
-        return None
 
     params = {
         "w": word,
-        "xml": "1",
     }
 
     try:
+
         response = requests.get(
             ONELOOK_URL,
             params=params,
@@ -138,34 +102,81 @@ def get_onelook_data(word):
 
         response.raise_for_status()
 
-    except requests.RequestException as e:
+        html = response.text
+
+        if not html:
+            return None
+
+        soup = BeautifulSoup(
+            html,
+            "html.parser",
+        )
+
+        text = soup.get_text(
+            "\n",
+            strip=True,
+        )
+
+        if not text:
+            return None
+
+        # Check whether OneLook actually
+        # found dictionary information.
+        found = re.search(
+            r"We found\s+(\d+)\s+dict",
+            text,
+            re.IGNORECASE,
+        )
+
+        dictionary_count = 0
+
+        if found:
+            dictionary_count = int(
+                found.group(1)
+            )
+
+        definitions = []
+
+        # OneLook page contains sections such as
+        # "Definitions from Wiktionary".
+        lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip()
+        ]
+
+        for i, line in enumerate(lines):
+
+            if (
+                "Definitions from" in line
+                or "definition" in line.lower()
+            ):
+                continue
+
+            # Capture useful short definition-like
+            # lines without trying to fully parse
+            # OneLook's entire page.
+            if 10 <= len(line) <= 500:
+
+                if line not in definitions:
+
+                    definitions.append(line)
+
+        return {
+            "word": word,
+            "dictionary_count": dictionary_count,
+            "text": text,
+            "definitions": definitions[:30],
+        }
+
+    except Exception as e:
+
         logging.error(
-            "OneLook request error: %s",
+            "OneLook error: %s",
             e,
         )
+
         return None
-
-    xml_text = response.text.strip()
-
-    if not xml_text:
-        return None
-
-    # Validate XML
-    try:
-        root = ET.fromstring(xml_text)
-
-    except ET.ParseError:
-        logging.error(
-            "OneLook returned invalid XML."
-        )
-        return None
-
-    # Store useful XML information without
-    # trying to interpret it yet.
-    return {
-        "raw_xml": xml_text,
-        "root_tag": root.tag,
-    }
 
 
 # =========================================================
@@ -175,7 +186,7 @@ def get_onelook_data(word):
 def collect_sources(word):
 
     logging.info(
-        "Searching sources for: %s",
+        "Searching: %s",
         word,
     )
 
@@ -184,13 +195,13 @@ def collect_sources(word):
     onelook = get_onelook_data(word)
 
     logging.info(
-        "Wiktionary found: %s",
-        bool(wiktionary),
+        "Wiktionary: %s",
+        "FOUND" if wiktionary else "NOT FOUND",
     )
 
     logging.info(
-        "OneLook found: %s",
-        bool(onelook),
+        "OneLook: %s",
+        "FOUND" if onelook else "NOT FOUND",
     )
 
     return {
@@ -201,10 +212,10 @@ def collect_sources(word):
 
 
 # =========================================================
-# TEMPORARY RESULT
+# TEMPORARY DISPLAY
 # =========================================================
 
-def format_test_result(data):
+def format_result(data):
 
     word = data["word"]
 
@@ -212,27 +223,42 @@ def format_test_result(data):
     onelook = data["onelook"]
 
     lines = [
-        f"📖 <b>{word}</b>",
+        f"📖 <b>{word.upper()}</b>",
         "",
         "━━━━━━━━━━━━━━━━━━",
         "",
-        "🔎 <b>Dictionary Sources</b>",
+        "📚 <b>Dictionary Sources</b>",
         "",
-        (
-            "• Wiktionary: ✅ Found"
-            if wiktionary
-            else "• Wiktionary: ❌ Not found"
-        ),
-        (
-            "• OneLook: ✅ Found"
-            if onelook
-            else "• OneLook: ❌ Not found"
-        ),
-        "",
-        "━━━━━━━━━━━━━━━━━━",
-        "",
-        "🧪 Source collection completed.",
     ]
+
+    if wiktionary:
+        lines.append("• Wiktionary: ✅ Found")
+    else:
+        lines.append("• Wiktionary: ❌ Not found")
+
+    if onelook:
+        count = onelook["dictionary_count"]
+
+        if count:
+            lines.append(
+                f"• OneLook: ✅ Found "
+                f"({count} dictionaries)"
+            )
+        else:
+            lines.append(
+                "• OneLook: ✅ Page found"
+            )
+    else:
+        lines.append(
+            "• OneLook: ❌ Not found"
+        )
+
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        "🧪 Source collection is working.",
+    ])
 
     return "\n".join(lines)
 
@@ -251,7 +277,6 @@ async def analyze_word(
     if not word:
         return
 
-    # For now we test single words only.
     if " " in word:
 
         await update.message.reply_text(
@@ -264,26 +289,21 @@ async def analyze_word(
         "🔎 Searching dictionary sources..."
     )
 
-    sources = collect_sources(word)
+    data = collect_sources(word)
 
-    if not sources["wiktionary"] and not sources["onelook"]:
+    if not data["wiktionary"] and not data["onelook"]:
 
         await update.message.reply_text(
-            f"❌ No dictionary data was found for "
+            f"❌ No dictionary data found for "
             f"<b>{word}</b>.",
             parse_mode="HTML",
         )
 
         return
 
-    result = format_test_result(
-        sources
-    )
-
     await update.message.reply_text(
-        result,
+        format_result(data),
         parse_mode="HTML",
-        disable_web_page_preview=True,
     )
 
 
@@ -323,7 +343,6 @@ async def handle_group(
         return
 
     message = update.message
-
     text = message.text or ""
 
     if not text:
@@ -334,28 +353,23 @@ async def handle_group(
     if not bot.username:
         return
 
-    username = bot.username
+    pattern = rf"@{re.escape(bot.username)}\b"
 
-    mention_pattern = rf"@{username}\b"
-
-    # The bot must be mentioned.
     if not re.search(
-        mention_pattern,
+        pattern,
         text,
-        flags=re.IGNORECASE,
+        re.IGNORECASE,
     ):
         return
 
-    # Remove the mention.
     clean_text = re.sub(
-        mention_pattern,
+        pattern,
         "",
         text,
         flags=re.IGNORECASE,
     ).strip()
 
-    # If there is no text after the mention,
-    # use the replied message.
+    # Reply mode
     if not clean_text:
 
         replied = message.reply_to_message
@@ -390,7 +404,6 @@ def main():
         .build()
     )
 
-    # Private messages
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE
@@ -400,7 +413,6 @@ def main():
         )
     )
 
-    # Group messages
     application.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS
