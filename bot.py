@@ -1,337 +1,186 @@
 import os
-import re
+import asyncio
 import logging
-import requests
+import sqlite3
+from contextlib import closing
 
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message
+from groq import AsyncGroq
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+DB_PATH = os.getenv("DB_PATH", "memory.db")
+
+MAX_HISTORY_MESSAGES = 12
+MAX_RETRIES = 3
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
-
-
-WIKTIONARY_API = "https://en.wiktionary.org/w/api.php"
-ONELOOK_URL = "https://www.onelook.com/"
-
-HEADERS = {
-    "User-Agent": "DictionaryBot/1.0"
-}
-
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is missing.")
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+client = AsyncGroq(api_key=GROQ_API_KEY)
 
-# =========================================================
-# WIKTIONARY
-# =========================================================
+SYSTEM_PROMPT = """
+You are a capable, honest AI assistant inside a Telegram bot.
 
-def get_wiktionary_data(word):
+Core behavior:
+- Answer the user's actual request directly.
+- Maintain conversational context when previous messages are relevant.
+- Never invent facts just to avoid saying you do not know.
+- When a question needs current, obscure, changing, or verifiable information,
+  use the available browser search tool.
+- Prefer reliable and primary sources when researching.
+- When web research is used, clearly distinguish verified information from
+  interpretation and include useful source references when available.
+- If a tool fails, retry when appropriate. Do not immediately answer with
+  a generic "failed" message.
+- If reliable information still cannot be obtained, explain specifically
+  what could not be verified instead of pretending.
+- Use the user's language unless they request another language.
+- Keep normal answers readable and reasonably concise.
+"""
 
-    try:
-        response = requests.get(
-            WIKTIONARY_API,
-            params={
-                "action": "parse",
-                "page": word,
-                "prop": "wikitext",
-                "redirects": 1,
-                "format": "json",
-                "formatversion": "2",
-            },
-            headers=HEADERS,
-            timeout=15,
+def init_db():
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+def get_history(user_id: str):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        rows = conn.execute("""
+            SELECT role, content
+            FROM messages
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (user_id, MAX_HISTORY_MESSAGES)).fetchall()
+
+    rows.reverse()
+    return [{"role": role, "content": content} for role, content in rows]
+
+def save_message(user_id: str, role: str, content: str):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "INSERT INTO messages (user_id, role, content) VALUES (?, ?, ?)",
+            (user_id, role, content),
         )
+        conn.commit()
 
-        response.raise_for_status()
+def clear_history(user_id: str):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
+        conn.commit()
 
-        data = response.json()
+async def ask_ai(user_id: str, user_text: str):
+    history = get_history(user_id)
 
-        parsed = data.get("parse")
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
 
-        if not parsed:
-            return None
+    last_error = None
 
-        return parsed.get("wikitext")
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = await client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=[{"type": "browser_search"}],
+                tool_choice="auto",
+                temperature=0.2,
+                max_completion_tokens=4096,
+            )
 
-    except Exception as e:
+            answer = response.choices[0].message.content
 
-        logging.error(
-            "Wiktionary error: %s",
-            e,
-        )
+            if answer and answer.strip():
+                answer = answer.strip()
 
-        return None
+                save_message(user_id, "user", user_text)
+                save_message(user_id, "assistant", answer)
 
+                return answer
 
-# =========================================================
-# ONELOOK
-# =========================================================
+            last_error = "The AI returned an empty response."
 
-def get_onelook_data(word):
+        except Exception as exc:
+            last_error = str(exc)
+            logging.exception("AI attempt %s/%s failed", attempt, MAX_RETRIES)
 
-    try:
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(1.5 * attempt)
 
-        response = requests.get(
-            ONELOOK_URL,
-            params={
-                "w": word,
-            },
-            headers=HEADERS,
-            timeout=15,
-        )
+    raise RuntimeError(last_error or "Unknown AI error")
 
-        response.raise_for_status()
-
-        html = response.text
-
-        if not html:
-            return None
-
-        return html
-
-    except Exception as e:
-
-        logging.error(
-            "OneLook error: %s",
-            e,
-        )
-
-        return None
-
-
-# =========================================================
-# COLLECT SOURCES
-# =========================================================
-
-def collect_sources(word):
-
-    logging.info(
-        "Searching sources for: %s",
-        word,
+@dp.message(Command("start"))
+async def start_handler(message: Message):
+    await message.answer(
+        "مرحبًا. أنا مساعد ذكاء اصطناعي.\n\n"
+        "يمكنني متابعة سياق المحادثة، واستخدام البحث في الويب "
+        "عندما تحتاج الإجابة إلى معلومات حديثة أو غير مؤكدة.\n\n"
+        "/new — بدء محادثة جديدة"
     )
 
-    wiktionary = get_wiktionary_data(word)
+@dp.message(Command("new"))
+async def new_handler(message: Message):
+    user_id = str(message.from_user.id)
+    clear_history(user_id)
+    await message.answer("تم بدء محادثة جديدة.")
 
-    onelook = get_onelook_data(word)
-
-    logging.info(
-        "Wiktionary: %s",
-        "FOUND" if wiktionary else "NOT FOUND",
-    )
-
-    logging.info(
-        "OneLook: %s",
-        "FOUND" if onelook else "NOT FOUND",
-    )
-
-    return {
-        "word": word,
-        "wiktionary": wiktionary,
-        "onelook": onelook,
-    }
-
-
-# =========================================================
-# TEMPORARY RESULT
-# =========================================================
-
-def format_result(data):
-
-    word = data["word"]
-
-    wiktionary = data["wiktionary"]
-    onelook = data["onelook"]
-
-    return (
-        f"📖 <b>{word.upper()}</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"📚 <b>Sources</b>\n\n"
-        f"• Wiktionary: "
-        f"{'✅ Found' if wiktionary else '❌ Not found'}\n"
-        f"• OneLook: "
-        f"{'✅ Page found' if onelook else '❌ Not found'}\n\n"
-        f"━━━━━━━━━━━━━━━━━━"
-    )
-
-
-# =========================================================
-# ANALYZE
-# =========================================================
-
-async def analyze_word(
-    update: Update,
-    word: str,
-):
-
-    word = word.strip()
-
-    if not word:
-        return
-
-    if " " in word:
-
-        await update.message.reply_text(
-            "📚 For now, send one English word."
-        )
-
-        return
-
-    await update.message.reply_text(
-        "🔎 Searching..."
-    )
-
-    data = collect_sources(word)
-
-    if not data["wiktionary"] and not data["onelook"]:
-
-        await update.message.reply_text(
-            f"❌ No data found for <b>{word}</b>.",
-            parse_mode="HTML",
-        )
-
-        return
-
-    await update.message.reply_text(
-        format_result(data),
-        parse_mode="HTML",
-    )
-
-
-# =========================================================
-# PRIVATE
-# =========================================================
-
-async def handle_private(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not update.message:
-        return
-
-    text = update.message.text
+@dp.message(F.text)
+async def chat_handler(message: Message):
+    user_id = str(message.from_user.id)
+    text = message.text.strip()
 
     if not text:
         return
 
-    await analyze_word(
-        update,
-        text,
-    )
-
-
-# =========================================================
-# GROUP
-# =========================================================
-
-async def handle_group(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not update.message:
-        return
-
-    message = update.message
-    text = message.text or ""
-
-    if not text:
-        return
-
-    bot = await context.bot.get_me()
-
-    if not bot.username:
-        return
-
-    pattern = rf"@{re.escape(bot.username)}\b"
-
-    if not re.search(
-        pattern,
-        text,
-        re.IGNORECASE,
-    ):
-        return
-
-    clean_text = re.sub(
-        pattern,
-        "",
-        text,
-        flags=re.IGNORECASE,
-    ).strip()
-
-    if not clean_text:
-
-        replied = message.reply_to_message
-
-        if replied and replied.text:
-            clean_text = replied.text.strip()
-
-    if not clean_text:
-
-        await message.reply_text(
-            "📚 Mention me with a word, "
-            "or reply to a message and mention me."
+    try:
+        await message.bot.send_chat_action(
+            chat_id=message.chat.id,
+            action="typing",
         )
 
-        return
+        answer = await ask_ai(user_id, text)
 
-    await analyze_word(
-        update,
-        clean_text,
-    )
+        # Telegram has a message-size limit, so split long answers.
+        chunk_size = 3900
+        for i in range(0, len(answer), chunk_size):
+            await message.answer(answer[i:i + chunk_size])
 
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE
-            & filters.TEXT
-            & ~filters.COMMAND,
-            handle_private,
+    except Exception:
+        logging.exception("Final request failure.")
+        await message.answer(
+            "تعذر إكمال الطلب بعد عدة محاولات. "
+            "تحقق من اتصال الخدمة أو مفاتيح API ثم حاول مرة أخرى."
         )
-    )
 
-    application.add_handler(
-        MessageHandler(
-            filters.ChatType.GROUPS
-            & filters.TEXT
-            & ~filters.COMMAND,
-            handle_group,
-        )
-    )
-
-    logging.info(
-        "Dictionary Bot is starting..."
-    )
-
-    application.run_polling(
-        drop_pending_updates=True
-    )
-
+async def main():
+    init_db()
+    logging.info("Bot starting with model: %s", MODEL)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
